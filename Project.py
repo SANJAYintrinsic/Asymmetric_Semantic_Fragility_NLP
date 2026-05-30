@@ -538,3 +538,138 @@ for idx, reason in zip(validation_results["failed_indices"], validation_results[
     print(f"  ❌ Input {idx}: {reason}")
 
 # --------------------------------------------------------------------------------------------------------------
+
+from IPython.display import display
+from tqdm.auto import tqdm
+import time
+
+# ==========================================
+# 8. EXPERIMENT RUNNER (The "conductor")
+# ==========================================
+class ExperimentRunner:
+    """
+    Orchestrates the end-to-end experiment.
+    Manages model lifecycles, batch processing, and metric calculation.
+    """
+    def __init__(self, env: ResearchEnvironment, data_engine: DataIngestionEngine):
+        self.env = env
+        self.data_engine = data_engine
+        self.results_cache = []
+
+    def run_full_experiment(self):
+        """
+        Main entry point. Iterates over all models in the config.
+        """
+        self.env.logger.info("🚀 STARTING FULL EXPERIMENT SEQUENCE")
+
+        # Outer Loop: Iterate through Models
+        for model_name in self.env.cfg.target_models:
+            self.env.logger.info(f"\n🔹 Processing Model: {model_name}")
+
+            # 1. Load Model (JIT Loading to save memory)
+            try:
+                model_wrapper = ModelInferenceWrapper(self.env, model_name)
+            except Exception as e:
+                self.env.logger.error(f"Skipping {model_name} due to load error.")
+                continue
+
+            # 2. Process Data in Batches
+            batch_iterator = self.data_engine.get_batch_iterator(self.env.cfg.batch_size)
+            total_batches = (len(self.data_engine.processed_data) // self.env.cfg.batch_size) + 1
+
+            # Progress Bar for Professional Feel
+            for batch in tqdm(batch_iterator, total=total_batches, desc=f"Testing {model_name.split('-')[0]}"):
+                self._process_batch(model_wrapper, batch, model_name)
+
+            # 3. Cleanup (Free GPU Memory)
+            del model_wrapper
+            torch.cuda.empty_cache()
+
+        self.env.logger.info("✅ Experiment Sequence Complete.")
+        return pd.DataFrame(self.results_cache)
+
+    def _process_batch(self, model: ModelInferenceWrapper, batch: pd.DataFrame, model_name: str):
+        """
+        Core Logic: Runs A and B through model, compares results.
+        """
+        # Prepare inputs
+        sentences_a = batch["sentence_a"].tolist()
+        sentences_b = batch["sentence_b"].tolist()
+
+        # Run Inference
+        # Note: In a real optimized setting, we could concat A and B into one batch,
+        # but keeping them separate is safer for memory on Colab.
+        preds_a, confs_a = model.predict_batch(sentences_a)
+        preds_b, confs_b = model.predict_batch(sentences_b)
+
+        # Calculate Metrics per Sample
+        for i in range(len(sentences_a)):
+            # The Novel Metric: Directional Fragility Score (DFS)
+            # DFS = Absolute difference in confidence
+            # Note: We must account for label flips. If label flips, fragility is high.
+
+            p_a = confs_a[i]
+            p_b = confs_b[i]
+            label_a = preds_a[i]
+            label_b = preds_b[i]
+
+            # Refined DFS Calculation:
+            # If labels match, just diff. If labels differ, the shift is massive.
+            # (Simplification for binary classification logic)
+            dfs = abs(p_a - p_b)
+
+            # Detect Failure Modes
+            flipped = (label_a != label_b)
+
+            # Store Record
+            self.results_cache.append({
+                "model": model_name,
+                "sentence_a": sentences_a[i],
+                "sentence_b": sentences_b[i],
+                "label_a": label_a,
+                "conf_a": p_a,
+                "label_b": label_b,
+                "conf_b": p_b,
+                "DFS": dfs,           # The key metric
+                "flipped": flipped,   # The fatal error
+                "timestamp": self.env.cfg.timestamp
+            })
+
+    def save_results(self):
+        """
+        Saves the results to CSV for your paper analysis.
+        """
+        if not self.results_cache:
+            self.env.logger.warning("No results to save!")
+            return
+
+        df = pd.DataFrame(self.results_cache)
+        filename = self.env.cfg.output_dir / "final_results.csv"
+        df.to_csv(filename, index=False)
+        self.env.logger.info(f"💾 Results saved to: {filename}")
+
+        # Print Quick Summary
+        print("\n--- 📊 QUICK EXPERIMENT SUMMARY ---")
+        summary = df.groupby("model").agg(
+            Avg_DFS=("DFS", "mean"),
+            Flip_Rate=("flipped", "mean"),
+            Sample_Count=("DFS", "count")
+        )
+        display(summary)
+
+# ==========================================
+# 9. FINAL EXECUTION (Press Play!)
+# ==========================================
+
+# 1. Initialize Runner
+runner = ExperimentRunner(env, data_engine)
+
+# 2. Run
+df_results = runner.run_full_experiment()
+
+# 3. Save
+runner.save_results()
+
+# 4. Show Top Fragilities (The "Interesting" cases)
+print("\n--- 🚨 TOP 5 MOST FRAGILE PAIRS (Where Model Broke) ---")
+display(df_results.sort_values(by="DFS", ascending=False).head(5)[["model", "sentence_a", "sentence_b", "DFS", "flipped"]])
