@@ -387,3 +387,154 @@ data_engine.load_benchmark(dataset_name="paws")
 # Inspect the standardized data
 print("\n--- DATA SNAPSHOT (First 3 Rows) ---")
 display(data_engine.processed_data.head(3))
+
+#----------------------------------------------------------------------------------------------------------------------------
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch.nn.functional as F
+from typing import List, Tuple
+
+# ==========================================
+# 6. INFERENCE ENGINE (The "Brain")
+# ==========================================
+class ModelInferenceWrapper:
+    """
+    A unified interface for different Transformer models.
+    Handles tokenization, GPU transfer, and probability extraction.
+    Includes built-in prompt validation to prevent vague inputs.
+    """
+    def __init__(self, env: ResearchEnvironment, model_name: str):
+        self.env = env
+        self.device = env.cfg.device
+        self.model_name = model_name
+
+        self.env.logger.info(f"🧠 Loading Model: {model_name}...")
+        try:
+            # AutoTokenizer handles the specific vocabulary for each model
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+            # Load Model and move to GPU (if available)
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            self.model.to(self.device)
+            self.model.eval() # Set to Evaluation Mode (crucial for deterministic behavior)
+
+            self.env.logger.info(f"✅ Model {model_name} loaded on {self.device}.")
+
+        except OSError as e:
+            self.env.logger.critical(f"❌ Could not load model {model_name}. Check internet or model name.")
+            raise e
+
+    def predict_batch(self, texts: List[str]) -> Tuple[List[int], List[float]]:
+        """
+        Runs inference on a batch of text with optional prompt validation.
+        Returns:
+            - labels: List of predicted class IDs (0 or 1)
+            - confidences: List of probabilities for the predicted class
+
+        Raises:
+            ValueError: If prompt validation is enabled and inputs are too vague
+        """
+        # ⚡ DEFENSE MECHANISM: Validate inputs before inference
+        if self.env.cfg.enforce_prompt_validation:
+            validation_report = PromptValidator.validate_batch(
+                texts,
+                raise_on_error=self.env.cfg.raise_on_vague_input
+            )
+
+            if validation_report["invalid_count"] > 0:
+                if self.env.cfg.raise_on_vague_input:
+                    # Will raise in validate_batch already
+                    pass
+                else:
+                    # Log warning and continue
+                    self.env.logger.warning(
+                        f"⚠️ Vague input(s) detected: {validation_report['invalid_count']}/{validation_report['total_count']} failed validation"
+                    )
+                    for idx, reason in zip(validation_report["failed_indices"], validation_report["failed_reasons"]):
+                        self.env.logger.warning(f"   └── Index {idx}: {reason}")
+
+        # 1. Tokenization (Padding & Truncation are critical for batching)
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+
+        # 2. Move inputs to the correct device (CPU/GPU)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # 3. Inference (No Gradients = Faster & Low Memory)
+        # Use automatic mixed precision if enabled in config
+        amp_device = "cuda" if self.device == "cuda" else "cpu"
+        autocast_ctx = torch.autocast(device_type=amp_device, enabled=self.env.cfg.mixed_precision and self.device == "cuda")
+        with torch.no_grad(), autocast_ctx:
+            outputs = self.model(**inputs)
+            logits = outputs.logits
+
+            # 4. Convert Logits to Probabilities using Softmax
+            probs = F.softmax(logits.float(), dim=-1)  # cast to float32 after AMP
+
+            # 5. Extract Prediction and Confidence
+            # We want the max probability and the corresponding label index
+            max_probs, predicted_ids = torch.max(probs, dim=1)
+
+        return predicted_ids.cpu().tolist(), max_probs.cpu().tolist()
+
+    def get_full_distribution(self, texts: List[str]) -> torch.Tensor:
+        """
+        Returns the full probability distribution for advanced metrics (Jensen-Shannon Divergence).
+        Useful for Phase 2 analysis.
+        """
+        # ⚡ Validate inputs here too
+        if self.env.cfg.enforce_prompt_validation:
+            validation_report = PromptValidator.validate_batch(texts, raise_on_error=False)
+            if validation_report["invalid_count"] > 0:
+                self.env.logger.warning(
+                    f"⚠️ {validation_report['invalid_count']} vague input(s) in batch. Proceeding with caution."
+                )
+
+        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
+        amp_device = "cuda" if self.device == "cuda" else "cpu"
+        autocast_ctx = torch.autocast(device_type=amp_device, enabled=self.env.cfg.mixed_precision and self.device == "cuda")
+        with torch.no_grad(), autocast_ctx:
+            logits = self.model(**inputs).logits
+            probs = F.softmax(logits.float(), dim=-1)
+        return probs.cpu()
+
+# ==========================================
+# 7. EXECUTION TEST (Module 3)
+# ==========================================
+# Let's test with the first model in your config
+test_model_name = config.target_models[0]
+inference_engine = ModelInferenceWrapper(env, test_model_name)
+
+# Sanity Check with Dummy Data
+dummy_batch = [
+    "This research is absolutely fascinating and novel.",
+    "I am extremely disappointed with the results."
+]
+
+labels, confs = inference_engine.predict_batch(dummy_batch)
+
+print("\n--- INFERENCE SANITY CHECK ---")
+for text, label, conf in zip(dummy_batch, labels, confs):
+    print(f"Text: '{text}'")
+    print(f"   └── Predicted Label: {label} | Confidence: {conf:.4f}")
+
+# Test the validation with intentionally vague inputs
+print("\n--- VALIDATION TEST (Intentionally Vague Inputs) ---")
+vague_inputs = [
+    "stuff",
+    "",
+    "ok",
+    "blah blah blah"
+]
+
+validation_results = PromptValidator.validate_batch(vague_inputs, raise_on_error=False)
+print(f"Validation Results: {validation_results['valid_count']}/{validation_results['total_count']} passed")
+for idx, reason in zip(validation_results["failed_indices"], validation_results["failed_reasons"]):
+    print(f"  ❌ Input {idx}: {reason}")
+
+# --------------------------------------------------------------------------------------------------------------
